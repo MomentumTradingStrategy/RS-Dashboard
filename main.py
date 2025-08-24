@@ -1,27 +1,22 @@
 # Relative Strength (RS) Dashboard — Yahoo batch + Nasdaq-100 Top 15
 # Columns: RS%, Ticker, Name
-# Run: streamlit run main.py --server.port 8080 --server.address 0.0.0.0
+# Run: python -m streamlit run main.py --server.port 8080 --server.address 0.0.0.0
 
-# --- Safe yfinance install for 3.8 envs (no manual requirements step needed) ---
-import subprocess, sys
-
-def _pip_install(*pkgs):
-    subprocess.check_call([sys.executable, "-m", "pip", "install", *pkgs])
-
+# --- Dependencies (installed via requirements.txt; no in-code pip) ---
 try:
     import yfinance as yf
 except Exception:
-    try:
-        _pip_install("--quiet", "pip>=23", "setuptools", "wheel", "typing_extensions>=4.7")
-        _pip_install("--quiet", "--upgrade", "yfinance==0.2.33", "multitasking==0.0.11")
-    except Exception:
-        _pip_install("--quiet", "--force-reinstall", "yfinance==0.2.33", "multitasking==0.0.11", "typing_extensions>=4.7")
-    import yfinance as yf
+    import streamlit as st
+    st.error("Missing dependency 'yfinance'. Add it to requirements.txt and restart.")
+    st.stop()
 
+import re
 from datetime import datetime, timedelta
 from typing import Dict, List
+
 import pandas as pd
 import streamlit as st
+from pandas_datareader import data as pdr  # fallback source (Stooq)
 
 # ---------- Page ----------
 st.set_page_config(page_title="Relative Strength (RS) Dashboard", layout="wide")
@@ -31,7 +26,7 @@ st.caption("See which markets are outperforming or lagging your selected benchma
 # ---------- Universe (Excel order) ----------
 # Note: NASDAQ Composite Index uses Yahoo ticker ^IXIC (was COMP which is a stock).
 GROUPS: Dict[str, List[str]] = {
-    "US Indices": ["SPY","QQQ","IWM","DIA","NYA","^IXIC","RSP","QQQE","EDOW","MDY","IWO","IWN","VTI"],
+    "US Indices": ["SPY","QQQ","IWM","DIA","^NYA","^IXIC","RSP","QQQE","EDOW","MDY","IWO","IWN","VTI"],
     "US Sectors": ["XLC","XLY","XLP","XLE","XLF","XLV","XLI","XLB","XLRE","XLK","XLU"],
     "Sub-Sectors / Industry Groups": [
         "GDX","XOP","IYR","XHB","ITB","VNQ","IYE","OIH","XME","XRT","SMH","IBB","KBE","KRE",
@@ -77,6 +72,9 @@ if not run:
     st.stop()
 
 # ---------- Helpers ----------
+def _chunk(lst, n):
+    for i in range(0, len(lst), n):
+        yield lst[i:i+n]
 
 def _to_y(sym: str) -> str:  # BRK.B -> BRK-B (caret tickers like ^IXIC pass through)
     return sym.replace(".", "-")
@@ -84,9 +82,19 @@ def _to_y(sym: str) -> str:  # BRK.B -> BRK-B (caret tickers like ^IXIC pass thr
 def _from_y(sym: str) -> str:
     return sym.replace("-", ".")
 
+def _to_stooq(sym: str) -> str:
+    # Stooq format for US stocks/ETFs: TICKER.US ; indices with ^ are spotty -> skip
+    if sym.startswith("^"):
+        return ""
+    base = sym.replace(".", "-")
+    if not re.fullmatch(r"[A-Z\-]{1,10}", base):
+        return ""
+    return f"{base}.US"
+
 @st.cache_data(ttl=60*60, show_spinner=False)
 def fetch_names_yf(symbols: List[str]) -> Dict[str, str]:
-    if not symbols: return {}
+    if not symbols:
+        return {}
     names: Dict[str, str] = {}
     tk = yf.Tickers(" ".join(_to_y(s) for s in symbols))
     for ysym, obj in tk.tickers.items():
@@ -106,30 +114,66 @@ def fetch_names_yf(symbols: List[str]) -> Dict[str, str]:
 
 @st.cache_data(ttl=15*60, show_spinner=True)
 def fetch_prices_yf(symbols: List[str], start: datetime, end: datetime) -> pd.DataFrame:
+    """Robust price fetch: Yahoo in chunks -> Stooq fallback for stocks/ETFs."""
     if not symbols:
         return pd.DataFrame()
+
+    frames = []
     y_syms = [_to_y(s) for s in symbols]
-    df = yf.download(
-        tickers=" ".join(y_syms),
-        start=pd.Timestamp(start),
-        end=pd.Timestamp(end) + pd.Timedelta(days=1),  # end exclusive
-        interval="1d",
-        auto_adjust=True,
-        progress=False,
-        group_by="column",
-        threads=True,
-    )
-    if df.empty:
+
+    # 1) Try Yahoo (chunked to avoid all-or-nothing empties)
+    for batch in _chunk(y_syms, 25):
+        try:
+            df = yf.download(
+                tickers=" ".join(batch),
+                start=pd.Timestamp(start),
+                end=pd.Timestamp(end) + pd.Timedelta(days=1),  # end exclusive
+                interval="1d",
+                auto_adjust=True,
+                progress=False,
+                group_by="column",
+                threads=True,
+            )
+            if df.empty:
+                continue
+            close = df["Close"].copy()
+            if isinstance(close, pd.Series):
+                close = close.to_frame()
+                close.columns = [_from_y(batch[0])]
+            else:
+                close.columns = [_from_y(c) for c in close.columns]
+            frames.append(close)
+        except Exception:
+            continue
+
+    if frames:
+        out = pd.concat(frames, axis=1)
+        want = [s for s in symbols if s in out.columns]  # preserve original order
+        return out[want].sort_index().ffill()
+
+    # 2) Yahoo unavailable: fallback to Stooq for stocks/ETFs (indices with ^ may be skipped)
+    cols = []
+    for sym in symbols:
+        stq = _to_stooq(sym)
+        if not stq:
+            continue
+        try:
+            d = pdr.DataReader(
+                stq, "stooq",
+                start=pd.Timestamp(start),
+                end=pd.Timestamp(end) + pd.Timedelta(days=1),
+            )
+            if not d.empty:
+                cols.append(d["Close"].rename(sym).to_frame())
+        except Exception:
+            continue
+
+    if not cols:
         return pd.DataFrame()
-    close = df["Close"].copy()
-    if isinstance(close, pd.Series):
-        close = close.to_frame()
-        close.columns = [_from_y(y_syms[0])]
-    else:
-        close.columns = [_from_y(c) for c in close.columns]
-        have = [s for s in symbols if s in close.columns]
-        close = close[have]
-    return close.sort_index().ffill()
+
+    out = pd.concat(cols, axis=1)
+    want = [s for s in symbols if s in out.columns]
+    return out[want].sort_index().ffill()
 
 # --- Robust Nasdaq-100 fetch (tries yfinance -> Wikipedia -> static fallback) ---
 @st.cache_data(ttl=24*60*60, show_spinner=False)
@@ -150,16 +194,13 @@ def fetch_nasdaq100_symbols() -> List[str]:
 
     # 2) Try Wikipedia table
     try:
-        tables = pd.read_html("https://en.wikipedia.org/wiki/Nasdaq-100")  # requires internet when app runs
-        # Find a table that looks like constituents
+        tables = pd.read_html("https://en.wikipedia.org/wiki/Nasdaq-100")
         for t in tables:
             cols = [c.lower() for c in t.columns.astype(str)]
             if any("ticker" in c or "symbol" in c for c in cols):
-                # normalize possible column names
                 for cand in ["Ticker", "Symbol", "Ticker symbol", "Ticker Symbol"]:
                     if cand in t.columns:
-                        syms = t[cand].astype(str).str.replace("\u00a0", " ").str.strip().str.upper()  # nbsp cleanup
-                        # Some rows may contain NASDAQ:XXX or have footnotes
+                        syms = t[cand].astype(str).str.replace("\u00a0", " ").str.strip().str.upper()
                         syms = syms.str.replace(r"^NASDAQ:\s*", "", regex=True)
                         syms = syms.str.replace(r"[^A-Z\.\-]", "", regex=True)
                         syms = [s for s in syms if len(s) >= 1]
@@ -167,7 +208,7 @@ def fetch_nasdaq100_symbols() -> List[str]:
     except Exception:
         pass
 
-    # 3) Static fallback list (kept broad; ok if a few drift). Update as needed.
+    # 3) Static fallback list (ok if a few drift)
     return [
         "AAPL","MSFT","NVDA","AMZN","META","GOOGL","GOOG","TSLA","AVGO","COST",
         "ADBE","NFLX","AMD","PEP","CSCO","LIN","QCOM","TMUS","INTC","TXN",
@@ -217,8 +258,19 @@ symbols = list(dict.fromkeys(symbols))  # de-dupe, preserve order
 
 # ---------- Fetch prices & compute RS ----------
 prices = fetch_prices_yf(symbols, start_date, end_date)
-if prices.empty or benchmark not in prices.columns:
-    st.error("No data returned or benchmark missing.")
+
+if prices.empty:
+    st.warning(
+        "No price data returned. Yahoo may be throttled; stocks/ETFs should still load via Stooq fallback. "
+        "Tip: start with 'US Indices' only, then add sections."
+    )
+    st.stop()
+
+if benchmark not in prices.columns:
+    st.warning(
+        f"Benchmark '{benchmark}' not found in returned data. "
+        "Check symbol (indexes often need a caret, e.g., ^NYA, ^IXIC)."
+    )
     st.stop()
 
 ff = prices.loc[prices.index >= pd.Timestamp(start_date)]
@@ -281,7 +333,6 @@ def fixed_order_df(tickers: List[str], base: pd.DataFrame) -> pd.DataFrame:
     sub["_ord"] = sub["Ticker"].map(order)
     return sub.sort_values("_ord").drop(columns=["_ord"]) if not sub.empty else sub
 
-
 def render_min_table(df: pd.DataFrame):
     v = df.copy()
     v["RS_STS_%"] = v["RS_STS_%"].round(0).astype(int)
@@ -329,3 +380,5 @@ We then measure the percentage change in that ratio from the first day to the la
 This shows how much the symbol outperformed or underperformed the benchmark.  
 Finally, all RS scores are ranked as a percentile (1–100) compared to all symbols shown in the dashboard.
 """
+)
+
