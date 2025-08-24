@@ -1,0 +1,6 @@
+streamlit==1.36.0
+pandas==2.0.3
+numpy==1.24.4
+requests==2.31.0
+yfinance
+pandas-datareader==0.10.0
