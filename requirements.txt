@@ -4,3 +4,4 @@ numpy==1.24.4
 requests==2.31.0
 yfinance==0.2.33
 pandas-datareader==0.10.0
+lxml==5.2.2
